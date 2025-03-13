@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "dgSpecHash": "jIClveNymZE=",
+  "success": true,
+  "projectFilePath": "C:\\dev\\VS\\ScraperApp\\ScraperApp.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\jacinto.martinez\\.nuget\\packages\\dotnetseleniumextras.waithelpers\\3.11.0\\dotnetseleniumextras.waithelpers.3.11.0.nupkg.sha512",
+    "C:\\Users\\jacinto.martinez\\.nuget\\packages\\htmlagilitypack\\1.12.0\\htmlagilitypack.1.12.0.nupkg.sha512",
+    "C:\\Users\\jacinto.martinez\\.nuget\\packages\\selenium.support\\4.29.0\\selenium.support.4.29.0.nupkg.sha512",
+    "C:\\Users\\jacinto.martinez\\.nuget\\packages\\selenium.webdriver\\4.29.0\\selenium.webdriver.4.29.0.nupkg.sha512"
+  ],
+  "logs": []
+}
