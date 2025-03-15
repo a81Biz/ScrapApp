@@ -7,12 +7,19 @@ using System.Globalization;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using System.Web;
 
 namespace ScraperApp.Scrapers
 {
     public class ProductDetailScraper : ScraperBase
     {
-        public async Task<Product> ScrapeProductDetail(ListProducts listProducts)
+
+        private readonly ApiService _apiService;
+        public ProductDetailScraper()
+        {
+            _apiService = new ApiService();
+        }
+        public async Task<bool> ScrapeProductDetail(ListProducts listProducts)
         {
             if (string.IsNullOrWhiteSpace(listProducts.productUrl))
             {
@@ -26,7 +33,7 @@ namespace ScraperApp.Scrapers
             if (document == null)
             {
                 Console.WriteLine($"Failed to load HTML document for URL: {listProducts.productUrl}");
-                return new Product();
+                return false;
             }
 
             // Extracción del nombre del producto
@@ -37,12 +44,19 @@ namespace ScraperApp.Scrapers
             if (string.IsNullOrEmpty(productName))
             {
                 Console.WriteLine("Product name not found.");
-                return new Product();
+                return false;
+            }
+
+            List<Product> existingProducts = await SearchProductByName(productName);
+
+            if (existingProducts.Count > 0)
+            {
+                Console.WriteLine($"Product '{productName}' already exists in WooCommerce. Skipping...");
+                return false;
             }
 
             product.Name = productName;
-            product.Url = listProducts.productUrl;
-            product.Category = listProducts.Category!;
+            product.Categories = new List<Category> { new Category { Id = listProducts.Category! } };
 
             var priceNode = document.DocumentNode
                             .SelectSingleNode("//div[@data-product-pricing]//span[@data-price]")
@@ -50,7 +64,7 @@ namespace ScraperApp.Scrapers
 
             if (decimal.TryParse(priceNode?.Replace("$", "").Replace(",", ""), NumberStyles.Any, CultureInfo.InvariantCulture, out var price))
             {
-                product.Price = price;
+                product.RegularPrice = price.ToString();
             }
 
             var description = document.DocumentNode.SelectSingleNode("//div[@data-product-description]");
@@ -58,18 +72,44 @@ namespace ScraperApp.Scrapers
 
             var vendor = document.DocumentNode.SelectSingleNode("//div[@class='product-vendor']//a");
 
-            product.Vendor = vendor != null ? vendor.InnerText.Trim() : string.Empty;
+            product.MetaData = new List<ProductMetaData>
+            {
+            new ProductMetaData { Key = "original_product_url", Value = listProducts.productUrl },
+            new ProductMetaData { Key = "vendor_url", Value = listProducts.baseUrl! }
+            };
 
             var imageNodes = document.DocumentNode.SelectNodes("//div[contains(@class, 'product-gallery--image-background')]//img");
-            if (imageNodes != null)
+            product.Images = imageNodes != null ? imageNodes.Select(img =>
             {
-                product.Images = imageNodes.Select(img => {
-                    var imgUrl = img.GetAttributeValue("src", string.Empty);
-                    return imgUrl.StartsWith("//") ? "https:" + imgUrl : imgUrl.StartsWith("/") ? listProducts.baseUrl + imgUrl : imgUrl;
-                }).ToList();
-            }
+                var imgUrl = img.GetAttributeValue("src", string.Empty);
+                return new ProductImage {
+                    Src = imgUrl.StartsWith("//") ? "https:" + imgUrl
+                    : imgUrl.StartsWith("/") ? listProducts.baseUrl + imgUrl
+                    : imgUrl
+             };}).ToList() : new List<ProductImage>();
 
-            return product;
+            return await PostProduct(product);
+        }
+
+        private async Task<List<Product>> SearchProductByName(string productName)
+        {
+            string encodedProductName = HttpUtility.HtmlEncode(productName);
+            encodedProductName = Uri.EscapeDataString(encodedProductName);
+
+            return await _apiService.DataAsync<List<Product>>(HttpMethod.Get, "products", $"?search={encodedProductName}");
+        }
+        private async Task<bool> PostProduct(Product product)
+        {
+            try
+            {
+                Product createdProduct = await _apiService.DataAsync<Product>(HttpMethod.Post, "products", "", product);
+
+                return createdProduct != null && createdProduct.Id > 0;
+            }
+            catch (Exception ex)
+            {
+                return false;
+            }
         }
     }
 }

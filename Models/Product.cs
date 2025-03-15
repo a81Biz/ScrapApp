@@ -1,20 +1,57 @@
-﻿using System;
+﻿using Newtonsoft.Json;
+using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace ScraperApp.Models
 {
     public class Product
     {
-        public string? Name { get; set; }
-        public string? Description { get; set; }
-        public decimal Price { get; set; }
-        public string? Category { get; set; }
-        public string? ImageUrl { get; set; }
-        public string? Url { get; set; }
-        public string? Vendor { get; set; }
-        public List<string> Images { get; set; } = new List<string>(); // Evita null en listas
+        [JsonProperty("name")]
+        public string Name { get; set; }
+
+        [JsonProperty("type")]
+        public string Type { get; set; }
+
+        [JsonProperty("regular_price")]
+        public string RegularPrice { get; set; }
+
+        [JsonProperty("description")]
+        public string Description { get; set; }
+
+        [JsonProperty("categories")]
+        public List<Category> Categories { get; set; }
+
+        [JsonProperty("images")]
+        public List<ProductImage> Images { get; set; }
+
+        [JsonProperty("stock_status")]
+        public string StockStatus { get; set; }
+
+        [JsonProperty("meta_data")]
+        public List<ProductMetaData> MetaData { get; set; }
+
+        [JsonProperty("id")]
+        public int Id { get; set; }
+    }
+
+    public class Category
+    {
+        [JsonProperty("id")]
+        public int Id { get; set; }
+    }
+
+    public class ProductImage
+    {
+        [JsonProperty("src")]
+        public string Src { get; set; }
+    }
+
+    public class ProductMetaData
+    {
+        [JsonProperty("key")]
+        public string Key { get; set; }
+
+        [JsonProperty("value")]
+        public string Value { get; set; }
     }
 }

@@ -5,13 +5,15 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 class Program
 {
     static async Task Main(string[] args)
     {
-        List<Product> products = new List<Product>();
-        List<string> failedUrls = new List<string>();
+        List<ListProducts> listProducts = new List<ListProducts>();
+        List<ListProducts> failedUrls = new List<ListProducts>();
         List<string> retriedUrls = new List<string>();
+        int countProducts = 0;
 
         // Instancia del scraper específico
         var productDetail = new ProductDetailScraper();
@@ -20,59 +22,54 @@ class Program
 
         // URL de prueba
         string url = "https://www.redqueen.mx/";
-
-        Stopwatch stopwatch = new Stopwatch(); // Crea un nuevo Stopwatch
-        stopwatch.Start();  // Comienza a medir el tiempo
+        Stopwatch stopwatch = new Stopwatch();
 
         try
         {
-            NavUrls navUrls = await hrefsScraper.NavScraper(url);  // Asumiendo que es un método asíncrono.
+            // Obtener todas las URLs de navegación
+            NavUrls navUrls = await hrefsScraper.NavScraper(url);
 
-            foreach (var navUrl in navUrls.Urls)
+            // Ejecutar ScrapeProductList en paralelo para todas las URLs
+            var scrapeTasks = navUrls.Urls.Select(async navUrl =>
             {
                 navUrls.UrlProdcutList = navUrl;
-                List<ListProducts> listProducts = await productList.ScrapeProductList(navUrls);
+                return await productList.ScrapeProductList(navUrls);
+            }).ToList();
 
-                List<Task<Product>> productTasks = new List<Task<Product>>();
-                foreach (var product in listProducts)
-                {
-                    productTasks.Add(productDetail.ScrapeProductDetail(product));
-                }
+            var allLists = await Task.WhenAll(scrapeTasks); // Esperar todas las tareas
+            listProducts = allLists.SelectMany(x => x).ToList(); // Combinar todas las listas
 
-                try
-                {
-                    Product[] productResponses = await Task.WhenAll(productTasks);
-                    foreach (var productResponse in productResponses)
-                    {
-                        if (productResponse != null)
-                        {
-                            products.Add(productResponse);
-                        }
-                    }
-                }
-                catch (Exception)
-                {
-                    failedUrls.Add(navUrl);
-                }
+            // ✅ Contar productos encontrados
+            countProducts += listProducts.Count;
 
-                foreach (var failedUrl in failedUrls)
+            // ✅ Ejecutar ScrapeProductDetail en paralelo
+            var productTasks = listProducts.Select(async product =>
+            {
+                bool saveProduct = await productDetail.ScrapeProductDetail(product);
+                return (product, saveProduct);
+            }).ToList();
+
+            var productResults = await Task.WhenAll(productTasks);
+
+            // ✅ Agregar productos fallidos
+            failedUrls.AddRange(productResults.Where(p => !p.saveProduct).Select(p => p.product));
+
+
+            if (failedUrls.Count > 0)
+            {
+                Console.WriteLine($"🔄 Reintentando {failedUrls.Count} productos que fallaron...");
+
+                foreach (var failedProduct in failedUrls)
                 {
-                    try
+                    bool retrySave = await productDetail.ScrapeProductDetail(failedProduct);
+
+                    if (!retrySave)
                     {
-                        var product = new ListProducts { productUrl = failedUrl };
-                        Product productResponse = await productDetail.ScrapeProductDetail(product);
-                        products.Add(productResponse);
-                        retriedUrls.Add(failedUrl);
-                    }
-                    catch (Exception)
-                    {
-                        // Falló el reintento, mantenemos la URL en la lista de fallidos
+                        Console.WriteLine($"❌ Falló nuevamente el scraping de: {failedProduct.productUrl}");
                     }
                 }
             }
 
-            string jsonProducts = JsonSerializer.Serialize(products);
-            Console.WriteLine(jsonProducts);
         }
         catch (Exception ex)
         {
@@ -80,19 +77,14 @@ class Program
         }
         finally
         {
+            TimeSpan elapsedTime = TimeSpan.FromMilliseconds(stopwatch.ElapsedMilliseconds);
             stopwatch.Stop();
-            Console.WriteLine($"Total execution time: {stopwatch.ElapsedMilliseconds} ms");
-            Console.WriteLine($"Total products found: {products.Count}");
+
+            Console.WriteLine($"Total execution time: {elapsedTime.Minutes} min {elapsedTime.Seconds} sec");
+            Console.WriteLine($"Total products found: {countProducts}");
             Console.WriteLine($"Total failed initial attempts: {failedUrls.Count}");
             Console.WriteLine($"Total retried and succeeded: {retriedUrls.Count}");
             Console.WriteLine($"Failed after retry (still pending): {failedUrls.Count - retriedUrls.Count}");
-
-            // Mostrar las URL que aún están pendientes
-            foreach (var failedUrl in failedUrls)
-            {
-                if (!retriedUrls.Contains(failedUrl))
-                    Console.WriteLine($"Pending URL: {failedUrl}");
-            }
         }
     }
 }

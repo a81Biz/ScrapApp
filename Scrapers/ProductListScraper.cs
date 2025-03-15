@@ -4,14 +4,22 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection.Metadata;
-using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
-using System.Xml.Linq;
 
 namespace ScraperApp.Scrapers
 {
     public class ProductListScraper : ScraperBase
     {
+        private readonly ApiService _apiService;
+        private static readonly SemaphoreSlim semaphore = new SemaphoreSlim(3); // Limita a 3 tareas simultáneas
+        private static readonly HttpClient _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(300) }; // Timeout aumentado
+
+        public ProductListScraper()
+        {
+            _apiService = new ApiService();
+        }
+
         public async Task<List<ListProducts>> ScrapeProductList(NavUrls nav)
         {
             if (nav == null || string.IsNullOrEmpty(nav.UrlBase))
@@ -25,21 +33,26 @@ namespace ScraperApp.Scrapers
             {
                 try
                 {
+                    // Limitar concurrencia con SemaphoreSlim
+                    await semaphore.WaitAsync();
                     nav.HtmlDocument = await GetHtmlDocument(currentUrl);
+                    semaphore.Release();
 
                     if (nav.HtmlDocument == null)
-                        throw new InvalidOperationException("Failed to load HTML document.");
+                    {
+                        Console.WriteLine("❌ Error: No se pudo cargar el HTML de la página.");
+                        return allProductLinks;
+                    }
 
-                    allProductLinks.AddRange(ProductsList(nav));
+                    // ✅ Ahora se espera correctamente la lista de productos
+                    List<ListProducts> productsOnPage = await ProductsList(nav);
+                    allProductLinks.AddRange(productsOnPage);
 
-                    var nextPageLink = nav.HtmlDocument!.DocumentNode.SelectSingleNode("//a[@aria-label='Go to next page']");
+                    var nextPageLink = nav.HtmlDocument.DocumentNode.SelectSingleNode("//a[@aria-label='Go to next page']");
                     if (nextPageLink != null)
                     {
                         string relativeUrl = nextPageLink.GetAttributeValue("href", string.Empty);
-                        if (!string.IsNullOrEmpty(relativeUrl))
-                        {
-                            currentUrl = relativeUrl.StartsWith("/") ? nav.UrlBase! + relativeUrl : relativeUrl;
-                        }
+                        currentUrl = relativeUrl.StartsWith("/") ? nav.UrlBase + relativeUrl : relativeUrl;
                     }
                     else
                     {
@@ -48,41 +61,133 @@ namespace ScraperApp.Scrapers
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"An error occurred while scraping the product list: {ex.Message}");
-                    hasNextPage = false; // Stop the loop if an error occurs
+                    Console.WriteLine($"❌ Error en ScrapeProductList: {ex.Message}");
+                    hasNextPage = false;
                 }
             }
             return allProductLinks;
         }
 
-        private List<ListProducts> ProductsList(NavUrls nav)
+        private async Task<List<ListProducts>> ProductsList(NavUrls nav)
         {
             List<ListProducts> listProducts = new List<ListProducts>();
 
-
-            var nodes = nav.HtmlDocument!.DocumentNode.SelectNodes("//div[contains(@class, 'productitem')]//a[contains(@class, 'productitem--image-link')]");
-            if (nodes != null)
+            try
             {
-                var categoryNode = nav.HtmlDocument.DocumentNode.SelectSingleNode("//h1[contains(@class, 'collection--title')]");
-                var category = categoryNode != null ? categoryNode.InnerText.Trim() : "Unknown Category";
-
-                foreach (var node in nodes)
+                var nodes = nav.HtmlDocument.DocumentNode.SelectNodes("//div[contains(@class, 'productitem')]//a[contains(@class, 'productitem--image-link')]");
+                if (nodes != null)
                 {
-                    ListProducts singleProduct = new ListProducts();
-                    var relativeUrl = node.GetAttributeValue("href", string.Empty);
-                    var fullUrl = relativeUrl.StartsWith("/") ? nav.UrlBase!.TrimEnd('/') + "/" + relativeUrl.TrimStart('/') : relativeUrl;
+                    ProductCategory productCategory = new ProductCategory();
 
-                    singleProduct.Category = category;
-                    singleProduct.productUrl = fullUrl;
+                    var img = nav.HtmlDocument.DocumentNode.SelectSingleNode("//figure[contains(@class, 'collection--image')]//img");
+                    var imgUrl = img != null ? img.GetAttributeValue("src", string.Empty) : null;
 
-                    listProducts.Add(singleProduct);
+                    if (!string.IsNullOrEmpty(imgUrl))
+                    {
+                        if (imgUrl.StartsWith("//"))
+                        {
+                            imgUrl = "https:" + imgUrl;  // ✅ Corrige el formato de `https://`
+                        }
+                        else if (imgUrl.StartsWith("www"))
+                        {
+                            imgUrl = "https://" + imgUrl;  // ✅ Asegura que URLs con `www` tengan `https://`
+                        }
+                        else if (imgUrl.StartsWith("/"))
+                        {
+                            imgUrl = nav.UrlBase.TrimEnd('/') + imgUrl;  // ✅ Concatena correctamente `nav.UrlBase`
+                        }
+
+                        productCategory.Image.Src = imgUrl; // Asignar la URL corregida a la imagen
+                    }
+
+                    var categoryNameNode = nav.HtmlDocument.DocumentNode.SelectSingleNode("//h1[contains(@class, 'collection--title')]");
+                    var categoryDescName = nav.HtmlDocument.DocumentNode.SelectSingleNode("//div[contains(@class, 'collection--description')]");
+
+                    productCategory.Name = categoryNameNode != null ? categoryNameNode.InnerText.Trim() : "Unknown Category";
+                    productCategory.Description = categoryDescName != null ? categoryDescName.InnerText.Trim() : " ";
+
+                    // ✅ Asegurar ejecución secuencial
+                    productCategory = await CompareCategory(productCategory);
+
+                    foreach (var node in nodes)
+                    {
+                        ListProducts singleProduct = new ListProducts();
+                        var relativeUrl = node.GetAttributeValue("href", string.Empty);
+                        var fullUrl = relativeUrl.StartsWith("/") ? nav.UrlBase.TrimEnd('/') + "/" + relativeUrl.TrimStart('/') : relativeUrl;
+
+                        singleProduct.Category = productCategory.Id;
+                        singleProduct.productUrl = fullUrl;
+
+                        listProducts.Add(singleProduct);
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("⚠️ Advertencia: No se encontraron productos en la página.");
                 }
             }
-            else
+            catch (Exception ex)
             {
-                Console.WriteLine("No product nodes found.");
+                Console.WriteLine($"❌ Error en ProductsList: {ex.Message}");
             }
             return listProducts;
+        }
+
+        private async Task<ProductCategory> CompareCategory(ProductCategory productCategory)
+        {
+            try
+            {
+                List<ProductCategory> categories = await GetCategories();
+                if (categories == null || categories.Count == 0)
+                {
+                    Console.WriteLine("⚠️ Advertencia: No se encontraron categorías en WooCommerce.");
+                    return new ProductCategory { Name = "Categoría Desconocida" };
+                }
+
+                ProductCategory? category = categories.FirstOrDefault(c => c.Slug == productCategory.Slug);
+                if (category != null)
+                {
+                    Console.WriteLine($"✅ Categoría encontrada: {category.Name}");
+                    return category;
+                }
+                else
+                {
+                    Console.WriteLine($"🆕 Creando nueva categoría: {productCategory.Name}");
+                    ProductCategory newCategory = await PostCategories(productCategory);
+                    return newCategory ?? new ProductCategory { Name = "Categoría No Creada" };
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ Error en CompareCategory: {ex.Message}");
+                return new ProductCategory { Name = "Error al Obtener Categoría" };
+            }
+        }
+
+        private async Task<List<ProductCategory>> GetCategories()
+        {
+            try
+            {
+                return await _apiService.DataAsync<List<ProductCategory>>(HttpMethod.Get, "products", "categories") ?? new List<ProductCategory>();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ Error en GetCategories: {ex.Message}");
+                return new List<ProductCategory>();
+            }
+        }
+
+        private async Task<ProductCategory> PostCategories(ProductCategory productCategory)
+        {
+            try
+            {
+                return await _apiService.DataAsync<ProductCategory>(HttpMethod.Post, "products", "categories", productCategory) ?? new ProductCategory { Name = "Categoría No Creada" };
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ Error en PostCategories: {ex.Message}");
+                return new ProductCategory { Name = "Error al Crear" };
+            }
         }
     }
 }

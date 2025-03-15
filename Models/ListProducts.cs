@@ -11,7 +11,7 @@ namespace ScraperApp.Models
     {
         public string? baseUrl { get; set; }
         public string? productUrl { get; set; }
-        public string? Category { get; set; }
+        public int Category { get; set; }
         public HtmlDocument? htmlDocument { get; set; }
     }
 }
