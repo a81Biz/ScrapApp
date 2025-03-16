@@ -6,16 +6,19 @@ using SeleniumExtras.WaitHelpers;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Threading.Tasks;
 
 public abstract class ScraperBase
 {
     protected HttpClient httpClient;
     public static int RequestCount = 0;
+    public List<string> ProductList;
 
     public ScraperBase()
     {
         httpClient = new HttpClient();
+        ProductList  = [];
     }
 
     public async Task<HtmlDocument?> GetHtmlDocument(string url)

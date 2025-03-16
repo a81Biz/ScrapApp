@@ -1,58 +1,108 @@
 ﻿using HtmlAgilityPack;
+using Microsoft.Extensions.Logging;
+using System.Text.Json;
+using OpenQA.Selenium;
 using ScraperApp.Models;
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Reflection.Metadata;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Net;
 
 namespace ScraperApp.Scrapers
 {
     public class ProductListScraper : ScraperBase
     {
         private readonly ApiService _apiService;
-        private static readonly SemaphoreSlim semaphore = new SemaphoreSlim(3); // Limita a 3 tareas simultáneas
-        private static readonly HttpClient _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(300) }; // Timeout aumentado
+        private readonly ILogger<ProductListScraper> _logger;
+        private static readonly SemaphoreSlim semaphore = new SemaphoreSlim(10); // Limita a 3 tareas simultáneas
 
-        public ProductListScraper()
+        public ProductListScraper(ApiService apiService, ILogger<ProductListScraper> logger)
         {
-            _apiService = new ApiService();
+            _apiService = apiService ?? throw new ArgumentNullException(nameof(apiService));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         }
 
         public async Task<List<ListProducts>> ScrapeProductList(NavUrls nav)
         {
             if (nav == null || string.IsNullOrEmpty(nav.UrlBase))
+            {
+                _logger.LogError("NavUrls object is not properly initialized.");
                 throw new ArgumentException("NavUrls object is not properly initialized.");
+            }
+
+            if (nav.UrlBase.TrimEnd('/') == nav.UrlProdcutList.TrimEnd('/'))
+            {
+                _logger.LogError("Index.");
+                throw new ArgumentException("skip index.");
+            }
 
             List<ListProducts> allProductLinks = new List<ListProducts>();
+            HashSet<string> visitedUrls = new HashSet<string>(); // 🔹 Nuevo: Rastrea las URLs visitadas
             string currentUrl = nav.UrlProdcutList ?? throw new InvalidOperationException("URL for product list is not set.");
+
+            await semaphore.WaitAsync();
+            _logger.LogInformation($"Fetching initial HTML document from URL: {currentUrl}");
+            nav.HtmlDocument = await GetHtmlDocument(currentUrl);
+            semaphore.Release();
+
+            if (nav.HtmlDocument == null)
+            {
+                _logger.LogError("Failed to load initial HTML document from the page.");
+                return allProductLinks;
+            }
+
+            Structure structure = ValidateStructure(nav);
+            if (structure == null)
+            {
+                _logger.LogError("The page structure is not recognized.");
+                return allProductLinks;
+            }
+
             bool hasNextPage = true;
 
             while (hasNextPage)
             {
                 try
                 {
-                    // Limitar concurrencia con SemaphoreSlim
-                    await semaphore.WaitAsync();
-                    nav.HtmlDocument = await GetHtmlDocument(currentUrl);
-                    semaphore.Release();
-
-                    if (nav.HtmlDocument == null)
+                    // 🔹 Si la URL ya fue visitada, no repetirla
+                    if (visitedUrls.Contains(currentUrl))
                     {
-                        Console.WriteLine("❌ Error: No se pudo cargar el HTML de la página.");
-                        return allProductLinks;
+                        _logger.LogWarning($"Skipping already visited URL: {currentUrl}");
+                        hasNextPage = false;
+                        break;
                     }
 
-                    // ✅ Ahora se espera correctamente la lista de productos
-                    List<ListProducts> productsOnPage = await ProductsList(nav);
+                    visitedUrls.Add(currentUrl); // 🔹 Marcar la URL como visitada
+
+                    if (currentUrl != nav.UrlProdcutList)
+                    {
+                        await semaphore.WaitAsync();
+                        _logger.LogInformation($"Fetching HTML document from URL: {currentUrl}");
+                        nav.HtmlDocument = await GetHtmlDocument(currentUrl);
+                        nav.UrlProdcutList = currentUrl;
+                        semaphore.Release();
+                    }
+
+                    // 🔹 Extraer productos según la estructura detectada
+                    List<ListProducts> productsOnPage = await ProductsList(nav, structure);
                     allProductLinks.AddRange(productsOnPage);
 
-                    var nextPageLink = nav.HtmlDocument.DocumentNode.SelectSingleNode("//a[@aria-label='Go to next page']");
+                    // 🔹 Manejar paginación sin loops infinitos
+                    var nextPageLink = nav.HtmlDocument.DocumentNode.SelectSingleNode(structure.NextPageSelector);
                     if (nextPageLink != null)
                     {
                         string relativeUrl = nextPageLink.GetAttributeValue("href", string.Empty);
-                        currentUrl = relativeUrl.StartsWith("/") ? nav.UrlBase + relativeUrl : relativeUrl;
+                        if (!string.IsNullOrEmpty(relativeUrl) && !visitedUrls.Contains(relativeUrl))
+                        {
+                            currentUrl = relativeUrl.StartsWith("/") ? nav.UrlBase + relativeUrl : relativeUrl;
+                        }
+                        else
+                        {
+                            hasNextPage = false;
+                        }
                     }
                     else
                     {
@@ -61,133 +111,138 @@ namespace ScraperApp.Scrapers
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"❌ Error en ScrapeProductList: {ex.Message}");
+                    _logger.LogError(ex, "Error occurred in ScrapeProductList.");
                     hasNextPage = false;
                 }
             }
+
             return allProductLinks;
         }
 
-        private async Task<List<ListProducts>> ProductsList(NavUrls nav)
+        private Structure ValidateStructure(NavUrls nav)
+        {
+            foreach (var structure in StructureConfigurations.Structures)
+            {
+                var nextPageLink = nav.HtmlDocument.DocumentNode.SelectSingleNode(structure.NextPageSelector);
+                if (nextPageLink != null)
+                {
+                    _logger.LogInformation($"✅ Estructura detectada: {structure.Name}");
+                    return structure;
+                }
+            }
+
+            _logger.LogError($"❌ The page structure is not recognized. {nav.UrlProdcutList}");
+            return null;
+        }
+
+        private async Task<List<ListProducts>> ProductsList(NavUrls nav, Structure structure )
         {
             List<ListProducts> listProducts = new List<ListProducts>();
 
             try
             {
-                var nodes = nav.HtmlDocument.DocumentNode.SelectNodes("//div[contains(@class, 'productitem')]//a[contains(@class, 'productitem--image-link')]");
-                if (nodes != null)
+                var nodes = nav.HtmlDocument.DocumentNode.SelectNodes(structure.ProductContainerSelector);
+
+                if (nodes == null)
                 {
-                    ProductCategory productCategory = new ProductCategory();
-
-                    var img = nav.HtmlDocument.DocumentNode.SelectSingleNode("//figure[contains(@class, 'collection--image')]//img");
-                    var imgUrl = img != null ? img.GetAttributeValue("src", string.Empty) : null;
-
-                    if (!string.IsNullOrEmpty(imgUrl))
-                    {
-                        if (imgUrl.StartsWith("//"))
-                        {
-                            imgUrl = "https:" + imgUrl;  // ✅ Corrige el formato de `https://`
-                        }
-                        else if (imgUrl.StartsWith("www"))
-                        {
-                            imgUrl = "https://" + imgUrl;  // ✅ Asegura que URLs con `www` tengan `https://`
-                        }
-                        else if (imgUrl.StartsWith("/"))
-                        {
-                            imgUrl = nav.UrlBase.TrimEnd('/') + imgUrl;  // ✅ Concatena correctamente `nav.UrlBase`
-                        }
-
-                        productCategory.Image.Src = imgUrl; // Asignar la URL corregida a la imagen
-                    }
-
-                    var categoryNameNode = nav.HtmlDocument.DocumentNode.SelectSingleNode("//h1[contains(@class, 'collection--title')]");
-                    var categoryDescName = nav.HtmlDocument.DocumentNode.SelectSingleNode("//div[contains(@class, 'collection--description')]");
-
-                    productCategory.Name = categoryNameNode != null ? categoryNameNode.InnerText.Trim() : "Unknown Category";
-                    productCategory.Description = categoryDescName != null ? categoryDescName.InnerText.Trim() : " ";
-
-                    // ✅ Asegurar ejecución secuencial
-                    productCategory = await CompareCategory(productCategory);
-
-                    foreach (var node in nodes)
-                    {
-                        ListProducts singleProduct = new ListProducts();
-                        var relativeUrl = node.GetAttributeValue("href", string.Empty);
-                        var fullUrl = relativeUrl.StartsWith("/") ? nav.UrlBase.TrimEnd('/') + "/" + relativeUrl.TrimStart('/') : relativeUrl;
-
-                        singleProduct.Category = productCategory.Id;
-                        singleProduct.productUrl = fullUrl;
-
-                        listProducts.Add(singleProduct);
-                    }
+                    _logger.LogWarning($"No products found on the page. {nav.UrlProdcutList.ToString()}");
+                    return listProducts;
                 }
-                else
+
+                string name = nav.HtmlDocument.DocumentNode.SelectSingleNode(structure.CategoryName).InnerText.Trim();
+
+                _logger.LogInformation($"Fetching HTML document ProductsList: {nav.UrlProdcutList}");
+                ProductCategory productCategory = await PostCategories(new ProductCategory() { Name = name });
+
+                foreach (var node in nodes)
                 {
-                    Console.WriteLine("⚠️ Advertencia: No se encontraron productos en la página.");
+                    var relativeUrl = node.GetAttributeValue(structure.ProductUrlSelector, string.Empty);
+                    if (string.IsNullOrEmpty(relativeUrl))
+                    {
+                        _logger.LogWarning("Empty href attribute found in product link.");
+                        continue;
+                    }
+
+
+                    ListProducts newProduct = new ListProducts()
+                    {
+                        baseUrl = nav.UrlBase,
+                        productUrl = FormatUrl(relativeUrl, nav.UrlBase),
+                        Category = productCategory.Id
+                    };
+
+                    if (listProducts.Contains(newProduct)) return listProducts;
+
+                    // Agregar el producto a la lista
+                    listProducts.Add(newProduct);
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"❌ Error en ProductsList: {ex.Message}");
+                _logger.LogError(ex, "Error occurred in ProductsList.");
             }
+
             return listProducts;
         }
 
-        private async Task<ProductCategory> CompareCategory(ProductCategory productCategory)
+        private string FormatUrl(string imgUrl, string baseUrl)
         {
-            try
+            if (imgUrl.StartsWith("//"))
             {
-                List<ProductCategory> categories = await GetCategories();
-                if (categories == null || categories.Count == 0)
-                {
-                    Console.WriteLine("⚠️ Advertencia: No se encontraron categorías en WooCommerce.");
-                    return new ProductCategory { Name = "Categoría Desconocida" };
-                }
-
-                ProductCategory? category = categories.FirstOrDefault(c => c.Slug == productCategory.Slug);
-                if (category != null)
-                {
-                    Console.WriteLine($"✅ Categoría encontrada: {category.Name}");
-                    return category;
-                }
-                else
-                {
-                    Console.WriteLine($"🆕 Creando nueva categoría: {productCategory.Name}");
-                    ProductCategory newCategory = await PostCategories(productCategory);
-                    return newCategory ?? new ProductCategory { Name = "Categoría No Creada" };
-                }
+                return "https:" + imgUrl;
             }
-            catch (Exception ex)
+            else if (imgUrl.StartsWith("www"))
             {
-                Console.WriteLine($"❌ Error en CompareCategory: {ex.Message}");
-                return new ProductCategory { Name = "Error al Obtener Categoría" };
+                return "https://" + imgUrl;
             }
-        }
-
-        private async Task<List<ProductCategory>> GetCategories()
-        {
-            try
+            else if (imgUrl.StartsWith("/"))
             {
-                return await _apiService.DataAsync<List<ProductCategory>>(HttpMethod.Get, "products", "categories") ?? new List<ProductCategory>();
+                return baseUrl.TrimEnd('/') + imgUrl;
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"❌ Error en GetCategories: {ex.Message}");
-                return new List<ProductCategory>();
-            }
+            return imgUrl;
         }
 
         private async Task<ProductCategory> PostCategories(ProductCategory productCategory)
         {
-            try
+            // Intentar crear la categoría en WooCommerce
+            var response = await _apiService.DataAsyncResponse<string>(HttpMethod.Post, "products", "categories", productCategory);
+
+            ProductCategory category = new ProductCategory();
+
+            if (response == null) return category;
+
+            if (response.StatusCode == HttpStatusCode.BadRequest)
             {
-                return await _apiService.DataAsync<ProductCategory>(HttpMethod.Post, "products", "categories", productCategory) ?? new ProductCategory { Name = "Categoría No Creada" };
+                try
+                {
+                    // 🔹 Intentamos extraer `resource_id` si la categoría ya existe
+                    var errorResponse = JsonSerializer.Deserialize<ErrorCategoryResponse>(response.ErrorMessage);
+
+                    if (errorResponse?.Code == "term_exists" && errorResponse.Data != null)
+                    {
+                        category.Id = errorResponse.Data.ResourceId; // Usar el ID existente
+                        _logger.LogInformation($"✅ Categoría ya existente, usando ID {category.Id}");
+                    }
+                    else
+                    {
+                        _logger.LogError($"❌ Error al crear categoría: {response.ErrorMessage}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError($"❌ Error al procesar la respuesta de categoría existente: {ex.Message}");
+                }
             }
-            catch (Exception ex)
+            else if (response.StatusCode == HttpStatusCode.OK)
             {
-                Console.WriteLine($"❌ Error en PostCategories: {ex.Message}");
-                return new ProductCategory { Name = "Error al Crear" };
+                // 🔹 Si se creó correctamente, deserializamos la respuesta
+                category = JsonSerializer.Deserialize<ProductCategory>(response.Data);
+                _logger.LogInformation($"✅ Nueva categoría creada con ID {category.Id}");
             }
+
+            return category;
         }
+
+
     }
 }
