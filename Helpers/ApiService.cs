@@ -13,8 +13,8 @@ public class ApiService
 {
     private readonly HttpClient _httpClient;
     private const string BaseUrl = "https://localhost/wp-json/wc/v3/";
-    private const string ConsumerKey = "ck_7e7b334d5ac5d958e286c30db2a9326c4d332b67";
-    private const string ConsumerSecret = "cs_70c81322464a22edb7e1003b912e61fba9c3a15f";
+    private const string ConsumerKey = "***";
+    private const string ConsumerSecret = "***";
 
     public ApiService()
     {
